@@ -342,7 +342,14 @@ async def stream_request(
 
                 # 记录完整统计
                 try:
-                    total_tokens = usage_metadata.get("totalTokenCount", 0)
+                    total_tokens = (
+                        usage_metadata.get("totalTokenCount", 0)
+                        if usage_metadata
+                        else 0
+                    )
+                    log.debug(
+                        f"[GEMINICLI STREAM] Final usage metadata: {usage_metadata}, total_tokens: {total_tokens}"
+                    )
                     await credential_manager.record_usage(
                         current_file, model_name, total_tokens, True
                     )
@@ -514,27 +521,156 @@ async def non_stream_request(
                     model_key=model_group,
                 )
 
-                # 记录使用统计
-                try:
-                    resp_json = response.json()
-                    usage = resp_json.get("usageMetadata", {})
-                    total_tokens = usage.get("totalTokenCount", 0)
-                    log.debug(
-                        f"[GEMINICLI NON-STREAM] Usage metadata: {usage}, total_tokens: {total_tokens}"
-                    )
-                    await credential_manager.record_usage(
-                        current_file, model_name, total_tokens, True
-                    )
-                except Exception as e:
-                    log.error(f"Failed to record usage stats: {e}")
+                # 非流式请求
+                if not is_stream:
+                    try:
+                        resp_json = response.json()
+                        usage = resp_json.get("usageMetadata", {})
+                        total_tokens = usage.get("totalTokenCount", 0)
+                        log.debug(
+                            f"[GEMINICLI NON-STREAM] Usage metadata: {usage}, total_tokens: {total_tokens}"
+                        )
+                        await credential_manager.record_usage(
+                            current_file, model_name, total_tokens, True
+                        )
+                    except Exception as e:
+                        log.error(f"Failed to record usage stats: {e}")
 
-                # 创建响应头,移除压缩相关的header避免重复解压
-                response_headers = dict(response.headers)
-                response_headers.pop("content-encoding", None)
-                response_headers.pop("content-length", None)
+                    # 创建响应头,移除压缩相关的header避免重复解压
+                    response_headers = dict(response.headers)
+                    response_headers.pop("content-encoding", None)
+                    response_headers.pop("content-length", None)
 
-                return Response(
-                    content=response.content, status_code=200, headers=response_headers
+                    return Response(
+                        content=response.content,
+                        status_code=200,
+                        headers=response_headers,
+                    )
+
+                # 流式请求
+                log.debug(f"[GEMINICLI STREAM] 流式响应开始，模型: {model_name}")
+
+                async def stream_generator():
+                    # 确保在生成器内部引用正确的变量
+                    success_recorded = True
+                    usage_metadata = {}
+
+                    try:
+                        async for chunk in response.aiter_bytes():
+                            if chunk:
+                                # 尝试从chunk中提取usageMetadata
+                                try:
+                                    chunk_str = None
+                                    if isinstance(chunk, str):
+                                        chunk_str = chunk
+                                    elif isinstance(chunk, bytes):
+                                        chunk_str = chunk.decode("utf-8", errors="ignore")
+
+                                    if chunk_str:
+                                        # 按行分割处理多个SSE事件
+                                        lines = chunk_str.strip().split("\n")
+                                        for line in lines:
+                                            line = line.strip()
+                                            if line.startswith("data: ") and line != "data: [DONE]":
+                                                data_part = line[6:].strip()
+                                                if data_part:
+                                                    try:
+                                                        data_json = json.loads(data_part)
+                                                        if "usageMetadata" in data_json:
+                                                            usage_metadata = data_json[
+                                                                "usageMetadata"
+                                                            ]
+                                                            log.debug(
+                                                                f"[GEMINICLI STREAM] Found usage metadata: {usage_metadata}"
+                                                            )
+                                                    except json.JSONDecodeError:
+                                                        continue
+                                # 即使是 [DONE] 行，如果前面还有内容也应该被处理，所以这里不应该直接跳过整个循环
+                                # 但由于逻辑是逐行处理，这里不需要额外操作，只是确保非 [DONE] 的行被解析
+                                except Exception as e:
+                                    log.warning(
+                                        f"[GEMINICLI STREAM] Failed to parse chunk for usage: {e}"
+                                    )
+
+                            yield chunk
+
+                        # 流式响应结束，记录统计
+                        try:
+                            total_tokens = (
+                                usage_metadata.get("totalTokenCount", 0)
+                                if usage_metadata
+                                else 0
+                            )
+                            log.debug(
+                                f"[GEMINICLI STREAM] Final usage metadata: {usage_metadata}, total_tokens: {total_tokens}"
+                            )
+                            await credential_manager.record_usage(
+                                current_file, model_name, total_tokens, True
+                            )
+                        except Exception as e:
+                            log.error(f"Failed to record stream usage stats: {e}")
+
+                    except Exception as e:
+                        log.error(f"Stream generation error: {e}")
+                        yield json.dumps({"error": str(e)}).encode()
+
+                return StreamingResponse(
+                    stream_generator(), media_type="text/event-stream"
+                )
+
+                                    if chunk_str:
+                                        # 按行分割处理多个SSE事件
+                                        lines = chunk_str.strip().split("\n")
+                                        for line in lines:
+                                            line = line.strip()
+                                            if (
+                                                line.startswith("data: ")
+                                                and line != "data: [DONE]"
+                                            ):
+                                                data_part = line[6:].strip()
+                                                if data_part:
+                                                    try:
+                                                        data_json = json.loads(
+                                                            data_part
+                                                        )
+                                                        if "usageMetadata" in data_json:
+                                                            usage_metadata = data_json[
+                                                                "usageMetadata"
+                                                            ]
+                                                            log.debug(
+                                                                f"[GEMINICLI STREAM] Found usage metadata: {usage_metadata}"
+                                                            )
+                                                    except json.JSONDecodeError:
+                                                        continue
+                                except Exception as e:
+                                    log.warning(
+                                        f"[GEMINICLI STREAM] Failed to parse chunk for usage: {e}"
+                                    )
+
+                            yield chunk
+
+                        # 流式响应结束，记录统计
+                        try:
+                            total_tokens = (
+                                usage_metadata.get("totalTokenCount", 0)
+                                if usage_metadata
+                                else 0
+                            )
+                            log.debug(
+                                f"[GEMINICLI STREAM] Final usage metadata: {usage_metadata}, total_tokens: {total_tokens}"
+                            )
+                            await credential_manager.record_usage(
+                                current_file, model_name, total_tokens, True
+                            )
+                        except Exception as e:
+                            log.error(f"Failed to record stream usage stats: {e}")
+
+                    except Exception as e:
+                        log.error(f"Stream generation error: {e}")
+                        yield json.dumps({"error": str(e)}).encode()
+
+                return StreamingResponse(
+                    stream_generator(), media_type="text/event-stream"
                 )
 
             # 失败 - 记录最后一次错误
