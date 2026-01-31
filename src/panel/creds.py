@@ -34,10 +34,17 @@ from src.models import (
 from src.storage_adapter import get_storage_adapter
 from src.utils import (
     verify_panel_token,
-    verify_password,
     GEMINICLI_USER_AGENT,
     ANTIGRAVITY_USER_AGENT,
 )
+from src.auth import (
+    create_auth_url,
+    asyncio_complete_auth_flow,
+    complete_auth_flow_from_callback_url,
+    get_auth_status,
+    verify_password,
+)
+
 from src.api.antigravity import fetch_quota_info, build_antigravity_headers
 from src.google_oauth_api import Credentials, fetch_project_id
 from src.auth import (
