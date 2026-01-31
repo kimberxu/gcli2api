@@ -829,14 +829,13 @@ for part in response.candidates[0].content.parts:
 
 ## 📋 完整 API 参考
 
-### Web 控制台 API
-
-**认证端点**
+**Web 控制台 API**
 - `POST /auth/login` - 用户登录
 - `POST /auth/start` - 开始 OAuth 认证（支持 GCLI 和 Antigravity 模式）
 - `POST /auth/callback` - 处理 OAuth 回调
 - `POST /auth/callback-url` - 从回调 URL 直接完成认证
 - `GET /auth/status/{project_id}` - 检查认证状态
+- `GET /stats/usage` - 获取 API 使用统计数据（支持日期、模型、凭证筛选）
 
 **凭证管理端点**（支持 `mode=geminicli` 或 `mode=antigravity` 参数）
 - `POST /creds/upload` - 批量上传凭证文件（支持 JSON 和 ZIP）
