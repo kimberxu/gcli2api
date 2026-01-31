@@ -10,148 +10,49 @@ import time
 import zipfile
 from typing import List
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, Response
-from fastapi.responses import JSONResponse
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    UploadFile,
+    Response,
+    Request,
+)
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from log import log
 from src.credential_manager import credential_manager
 from src.models import (
     CredFileActionRequest,
-    CredFileBatchActionRequest
+    CredFileBatchActionRequest,
+    LoginRequest,
+    AuthStartRequest,
+    AuthCallbackRequest,
+    AuthCallbackUrlRequest,
 )
 from src.storage_adapter import get_storage_adapter
-from src.utils import verify_panel_token, GEMINICLI_USER_AGENT, ANTIGRAVITY_USER_AGENT
-from src.api.antigravity import fetch_quota_info
+from src.utils import (
+    verify_panel_token,
+    verify_password,
+    GEMINICLI_USER_AGENT,
+    ANTIGRAVITY_USER_AGENT,
+)
+from src.api.antigravity import fetch_quota_info, build_antigravity_headers
 from src.google_oauth_api import Credentials, fetch_project_id
+from src.auth import (
+    create_auth_url,
+    asyncio_complete_auth_flow,
+    complete_auth_flow_from_callback_url,
+    get_auth_status,
+)
 from config import get_code_assist_endpoint, get_antigravity_api_url
-from .utils import validate_mode
-
+import config
+from .utils import validate_mode, is_mobile_user_agent
+from src.httpx_client import post_async
 
 # 创建路由器
 router = APIRouter(prefix="/creds", tags=["credentials"])
-
-# 不在模块级创建实例，使用单例工厂按需获取
-# 直接按需从模块工厂获取凭证管理器，避免与 web.py 产生循环导入
-
-
-# 不在模块级创建实例，使用单例工厂按需获取
-# 直接按需从模块工厂获取凭证管理器，避免与 web.py 产生循环导入
-
-# WebSocket连接管理
-
-
-class ConnectionManager:
-    def __init__(self, max_connections: int = 3):  # 进一步降低最大连接数
-        # 使用双端队列严格限制内存使用
-        self.active_connections: deque = deque(maxlen=max_connections)
-        self.max_connections = max_connections
-        self._last_cleanup = 0
-        self._cleanup_interval = 120  # 120秒清理一次死连接
-
-    async def connect(self, websocket: WebSocket):
-        # 自动清理死连接
-        self._auto_cleanup()
-
-        # 限制最大连接数，防止内存无限增长
-        if len(self.active_connections) >= self.max_connections:
-            await websocket.close(code=1008, reason="Too many connections")
-            return False
-
-        await websocket.accept()
-        self.active_connections.append(websocket)
-        log.debug(f"WebSocket连接建立，当前连接数: {len(self.active_connections)}")
-        return True
-
-    def disconnect(self, websocket: WebSocket):
-        # 使用更高效的方式移除连接
-        try:
-            self.active_connections.remove(websocket)
-        except ValueError:
-            pass  # 连接已不存在
-        log.debug(f"WebSocket连接断开，当前连接数: {len(self.active_connections)}")
-
-    async def send_personal_message(self, message: str, websocket: WebSocket):
-        try:
-            await websocket.send_text(message)
-        except Exception:
-            self.disconnect(websocket)
-
-    async def broadcast(self, message: str):
-        # 使用更高效的方式处理广播，避免索引操作
-        dead_connections = []
-        for conn in self.active_connections:
-            try:
-                await conn.send_text(message)
-            except Exception:
-                dead_connections.append(conn)
-
-        # 批量移除死连接
-        for dead_conn in dead_connections:
-            self.disconnect(dead_conn)
-
-    def _auto_cleanup(self):
-        """自动清理死连接"""
-        current_time = time.time()
-        if current_time - self._last_cleanup > self._cleanup_interval:
-            self.cleanup_dead_connections()
-            self._last_cleanup = current_time
-
-    def cleanup_dead_connections(self):
-        """清理已断开的连接"""
-        original_count = len(self.active_connections)
-        # 使用列表推导式过滤活跃连接，更高效
-        alive_connections = deque(
-            [
-                conn
-                for conn in self.active_connections
-                if hasattr(conn, "client_state")
-                and conn.client_state != WebSocketState.DISCONNECTED
-            ],
-            maxlen=self.max_connections,
-        )
-
-        self.active_connections = alive_connections
-        cleaned = original_count - len(self.active_connections)
-        if cleaned > 0:
-            log.debug(
-                f"清理了 {cleaned} 个死连接，剩余连接数: {len(self.active_connections)}"
-            )
-
-
-manager = ConnectionManager()
-
-
-def is_mobile_user_agent(user_agent: str) -> bool:
-    """检测是否为移动设备用户代理"""
-    if not user_agent:
-        return False
-
-    user_agent_lower = user_agent.lower()
-    mobile_keywords = [
-        "mobile",
-        "android",
-        "iphone",
-        "ipad",
-        "ipod",
-        "blackberry",
-        "windows phone",
-        "samsung",
-        "htc",
-        "motorola",
-        "nokia",
-        "palm",
-        "webos",
-        "opera mini",
-        "opera mobi",
-        "fennec",
-        "minimo",
-        "symbian",
-        "psp",
-        "nintendo",
-        "tablet",
-    ]
-
-    return any(keyword in user_agent_lower for keyword in mobile_keywords)
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -362,37 +263,6 @@ async def check_auth_status(project_id: str, token: str = Depends(verify_panel_t
 # =============================================================================
 
 
-def validate_mode(mode: str = "geminicli") -> str:
-    """
-    验证 mode 参数
-
-    Args:
-        mode: 模式字符串 ("geminicli" 或 "antigravity")
-
-    Returns:
-        str: 验证后的 mode 字符串
-
-    Raises:
-        HTTPException: 如果 mode 参数无效
-    """
-    if mode not in ["geminicli", "antigravity"]:
-        raise HTTPException(
-            status_code=400,
-            detail=f"无效的 mode 参数: {mode}，只支持 'geminicli' 或 'antigravity'",
-        )
-    return mode
-
-
-def get_env_locked_keys() -> set:
-    """获取被环境变量锁定的配置键集合"""
-    env_locked_keys = set()
-
-    # 使用 config.py 中统一维护的映射表
-    for env_key, config_key in config.ENV_MAPPINGS.items():
-        if os.getenv(env_key):
-            env_locked_keys.add(config_key)
-
-    return env_locked_keys
 async def extract_json_files_from_zip(zip_file: UploadFile) -> List[dict]:
     """从ZIP文件中提取JSON文件"""
     try:
@@ -609,10 +479,13 @@ async def get_creds_status_common(
             status_code=400, detail="status_filter 只能是 all、enabled 或 disabled"
         )
     if cooldown_filter and cooldown_filter not in ["all", "in_cooldown", "no_cooldown"]:
-        raise HTTPException(status_code=400, detail="cooldown_filter 只能是 all、in_cooldown 或 no_cooldown")
+        raise HTTPException(
+            status_code=400,
+            detail="cooldown_filter 只能是 all、in_cooldown 或 no_cooldown",
+        )
 
     storage_adapter = await get_storage_adapter()
-        backend_info = await storage_adapter.get_backend_info()
+    backend_info = await storage_adapter.get_backend_info()
 
     backend_type = backend_info.get("backend_type", "unknown")
 
@@ -966,14 +839,15 @@ async def deduplicate_credentials_by_email_common(
         )
 
 
-async def verify_credential_project_common(filename: str, mode: str = "geminicli") -> JSONResponse:
+async def verify_credential_project_common(
+    filename: str, mode: str = "geminicli"
+) -> JSONResponse:
     """验证并重新获取凭证的project id的通用函数"""
     mode = validate_mode(mode)
 
     # 验证文件名
     if not filename.endswith(".json"):
         raise HTTPException(status_code=400, detail="无效的文件名")
-
 
     storage_adapter = await get_storage_adapter()
 
@@ -1006,7 +880,7 @@ async def verify_credential_project_common(filename: str, mode: str = "geminicli
     project_id = await fetch_project_id(
         access_token=credentials.access_token,
         user_agent=user_agent,
-        api_base_url=api_base_url
+        api_base_url=api_base_url,
     )
 
     if project_id:
@@ -1015,27 +889,30 @@ async def verify_credential_project_common(filename: str, mode: str = "geminicli
         await storage_adapter.store_credential(filename, credential_data, mode=mode)
 
         # 检验成功后自动解除禁用状态并清除错误码
-        await storage_adapter.update_credential_state(filename, {
-            "disabled": False,
-            "error_codes": []
-        }, mode=mode)
+        await storage_adapter.update_credential_state(
+            filename, {"disabled": False, "error_codes": []}, mode=mode
+        )
 
-        log.info(f"检验 {mode} 凭证成功: {filename} - Project ID: {project_id} - 已解除禁用并清除错误码")
+        log.info(
+            f"检验 {mode} 凭证成功: {filename} - Project ID: {project_id} - 已解除禁用并清除错误码"
+        )
 
-        return JSONResponse(content={
-            "success": True,
-            "filename": filename,
-            "project_id": project_id,
-            "message": "检验成功！Project ID已更新，已解除禁用状态并清除错误码，403错误应该已恢复"
-        })
+        return JSONResponse(
+            content={
+                "success": True,
+                "filename": filename,
+                "project_id": project_id,
+                "message": "检验成功！Project ID已更新，已解除禁用状态并清除错误码，403错误应该已恢复",
+            }
+        )
     else:
         return JSONResponse(
             status_code=400,
             content={
                 "success": False,
                 "filename": filename,
-                "message": "检验失败：无法获取Project ID，请检查凭证是否有效"
-            }
+                "message": "检验失败：无法获取Project ID，请检查凭证是否有效",
+            },
         )
 
 
@@ -1073,17 +950,6 @@ async def get_creds_status(
 ):
     """
     获取凭证文件的状态（轻量级摘要，不包含完整凭证数据，支持分页和状态筛选）
-
-    Args:
-        offset: 跳过的记录数（默认0）
-        limit: 每页返回的记录数（默认50，可选：20, 50, 100, 200, 500, 1000）
-        status_filter: 状态筛选（all=全部, enabled=仅启用, disabled=仅禁用）
-        error_code_filter: 错误码筛选（all=全部, 或具体错误码如"400", "403"）
-        cooldown_filter: 冷却状态筛选（all=全部, in_cooldown=冷却中, no_cooldown=未冷却）
-        mode: 凭证模式（geminicli 或 antigravity）
-
-    Returns:
-        包含凭证列表、总数、分页信息的响应
     """
     try:
         mode = validate_mode(mode)
@@ -1108,7 +974,6 @@ async def get_cred_detail(
 ):
     """
     按需获取单个凭证的详细数据（包含完整凭证内容）
-    用于用户查看/编辑凭证详情
     """
     try:
         mode = validate_mode(mode)
@@ -1378,6 +1243,21 @@ async def download_cred_file(
 
         # 转换为JSON字符串
         content = json.dumps(credential_data, ensure_ascii=False, indent=2)
+
+        return Response(
+            content=content,
+            media_type="application/json",
+            headers={
+                "Content-Disposition": f"attachment; filename={os.path.basename(filename)}"
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"下载文件失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/download-all")
 async def download_all_credentials(
     token: str = Depends(verify_panel_token), mode: str = "geminicli"
@@ -1393,7 +1273,7 @@ async def download_all_credentials(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/fetch-email/{filename}")
+@router.post("/fetch-email/{filename}")
 async def fetch_user_email(
     filename: str, token: str = Depends(verify_panel_token), mode: str = "geminicli"
 ):
@@ -1451,828 +1331,6 @@ async def verify_credential_project(
 
 @router.get("/quota/{filename}")
 async def get_credential_quota(
-    filename: str, token: str = Depends(verify_panel_token)
-):
-    """获取Antigravity凭证的额度信息"""
-    try:
-        # 验证文件名
-        if not filename.endswith(".json"):
-            raise HTTPException(status_code=400, detail="无效的文件名")
-
-        storage_adapter = await get_storage_adapter()
-
-        # 获取凭证数据 (强制使用antigravity模式)
-        credential_data = await storage_adapter.get_credential(
-            filename, mode="antigravity"
-        )
-        if not credential_data:
-            raise HTTPException(status_code=404, detail="凭证不存在")
-
-        # 创建凭证对象
-        credentials = Credentials.from_dict(credential_data)
-
-        # 确保token有效（自动刷新）
-        token_refreshed = await credentials.refresh_if_needed()
-
-        # 如果token被刷新了，更新存储
-        if token_refreshed:
-            log.info(f"Token已自动刷新: {filename} (mode=antigravity)")
-            credential_data = credentials.to_dict()
-            await storage_adapter.store_credential(
-                filename, credential_data, mode="antigravity"
-            )
-
-        # 获取额度信息
-        quota_info = await fetch_quota_info(credentials.access_token)
-
-        if quota_info:
-            return JSONResponse(content=quota_info)
-        else:
-            raise HTTPException(status_code=500, detail="无法获取额度信息")
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"获取额度信息失败 {filename}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/stats/usage")
-async def get_usage_stats(
-    start_date: str = None,
-    end_date: str = None,
-    filename: str = None,
-    model: str = None,
-    limit: int = 100,
-    token: str = Depends(verify_panel_token),
-):
-    """
-    获取使用统计数据
-    """
-    try:
-        storage_adapter = await get_storage_adapter()
-        
-        # 检查后端是否支持get_usage_stats
-        if not hasattr(storage_adapter, "get_usage_stats"):
-             return JSONResponse(content=[])
-
-        stats = await storage_adapter.get_usage_stats(
-            start_date=start_date,
-            end_date=end_date,
-            filename=filename,
-            model=model,
-            limit=limit,
-        )
-        return JSONResponse(content=stats)
-
-    except Exception as e:
-        log.error(f"获取使用统计失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/stats/usage")
-async def get_usage_stats(
-    start_date: str = None,
-    end_date: str = None,
-    filename: str = None,
-    model: str = None,
-    limit: int = 100,
-    token: str = Depends(verify_panel_token),
-):
-    """
-    获取使用统计数据
-    """
-    try:
-        storage_adapter = await get_storage_adapter()
-        
-        # 检查后端是否支持get_usage_stats
-        if not hasattr(storage_adapter, "get_usage_stats"):
-             return JSONResponse(content=[])
-
-        stats = await storage_adapter.get_usage_stats(
-            start_date=start_date,
-            end_date=end_date,
-            filename=filename,
-            model=model,
-            limit=limit,
-        )
-        return JSONResponse(content=stats)
-
-    except Exception as e:
-        log.error(f"获取使用统计失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/stats/usage")
-async def get_usage_stats(
-    start_date: str = None,
-    end_date: str = None,
-    filename: str = None,
-    model: str = None,
-    limit: int = 100,
-    token: str = Depends(verify_panel_token),
-):
-    """
-    获取使用统计数据
-    """
-    try:
-        storage_adapter = await get_storage_adapter()
-        
-        # 检查后端是否支持get_usage_stats
-        if not hasattr(storage_adapter, "get_usage_stats"):
-             return JSONResponse(content=[])
-
-        stats = await storage_adapter.get_usage_stats(
-            start_date=start_date,
-            end_date=end_date,
-            filename=filename,
-            model=model,
-            limit=limit,
-        )
-        return JSONResponse(content=stats)
-
-    except Exception as e:
-        log.error(f"获取使用统计失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-
-@router.post("/fetch-email/{filename}")
-async def fetch_user_email(
-    filename: str, token: str = Depends(verify_panel_token), mode: str = "geminicli"
-):
-    """获取指定凭证文件的用户邮箱地址"""
-    try:
-        mode = validate_mode(mode)
-        return await fetch_user_email_common(filename, mode=mode)
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"获取用户邮箱失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/refresh-all-emails")
-async def refresh_all_user_emails(
-    token: str = Depends(verify_panel_token), mode: str = "geminicli"
-):
-    """刷新所有凭证文件的用户邮箱地址"""
-    try:
-        mode = validate_mode(mode)
-        return await refresh_all_user_emails_common(mode=mode)
-    except Exception as e:
-        log.error(f"批量获取用户邮箱失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/deduplicate-by-email")
-async def deduplicate_credentials_by_email(
-    token: str = Depends(verify_panel_token), mode: str = "geminicli"
-):
-    """批量去重凭证文件 - 删除邮箱相同的凭证（只保留一个）"""
-    try:
-        mode = validate_mode(mode)
-        return await deduplicate_credentials_by_email_common(mode=mode)
-    except Exception as e:
-        log.error(f"批量去重凭证失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/download-all")
-async def download_all_creds(
-    token: str = Depends(verify_panel_token), mode: str = "geminicli"
-):
-    """
-    打包下载所有凭证文件（流式处理，按需加载每个凭证数据）
-    只在实际下载时才加载完整凭证内容，最大化性能
-    """
-    try:
-        mode = validate_mode(mode)
-        return await download_all_creds_common(mode=mode)
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"打包下载失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-<<<<<<< HEAD:src/panel/creds.py
-@router.post("/verify-project/{filename}")
-=======
-@router.get("/config/get")
-async def get_config(token: str = Depends(verify_panel_token)):
-    """获取当前配置"""
-    try:
-        # 读取当前配置（包括环境变量和TOML文件中的配置）
-        current_config = {}
-
-        # 基础配置
-        current_config["code_assist_endpoint"] = await config.get_code_assist_endpoint()
-        current_config["credentials_dir"] = await config.get_credentials_dir()
-        current_config["proxy"] = await config.get_proxy_config() or ""
-
-        # 代理端点配置
-        current_config["oauth_proxy_url"] = await config.get_oauth_proxy_url()
-        current_config["googleapis_proxy_url"] = await config.get_googleapis_proxy_url()
-        current_config[
-            "resource_manager_api_url"
-        ] = await config.get_resource_manager_api_url()
-        current_config[
-            "service_usage_api_url"
-        ] = await config.get_service_usage_api_url()
-        current_config["antigravity_api_url"] = await config.get_antigravity_api_url()
-
-        # 自动封禁配置
-        current_config["auto_ban_enabled"] = await config.get_auto_ban_enabled()
-        current_config["auto_ban_error_codes"] = await config.get_auto_ban_error_codes()
-
-        # 429重试配置
-        current_config[
-            "retry_429_max_retries"
-        ] = await config.get_retry_429_max_retries()
-        current_config["retry_429_enabled"] = await config.get_retry_429_enabled()
-        current_config["retry_429_interval"] = await config.get_retry_429_interval()
-
-        # 抗截断配置
-        current_config[
-            "anti_truncation_max_attempts"
-        ] = await config.get_anti_truncation_max_attempts()
-
-        # 兼容性配置
-        current_config[
-            "compatibility_mode_enabled"
-        ] = await config.get_compatibility_mode_enabled()
-
-        # 思维链返回配置
-        current_config[
-            "return_thoughts_to_frontend"
-        ] = await config.get_return_thoughts_to_frontend()
-
-        # Antigravity流式转非流式配置
-        current_config[
-            "antigravity_stream2nostream"
-        ] = await config.get_antigravity_stream2nostream()
-
-        # 服务器配置
-        current_config["host"] = await config.get_server_host()
-        current_config["port"] = await config.get_server_port()
-        current_config["api_password"] = await config.get_api_password()
-        current_config["panel_password"] = await config.get_panel_password()
-        current_config["password"] = await config.get_server_password()
-
-        # 从存储系统读取配置
-        storage_adapter = await get_storage_adapter()
-        storage_config = await storage_adapter.get_all_config()
-
-        # 获取环境变量锁定的配置键
-        env_locked_keys = get_env_locked_keys()
-
-        # 合并存储系统配置（不覆盖环境变量）
-        for key, value in storage_config.items():
-            if key not in env_locked_keys:
-                current_config[key] = value
-
-        return JSONResponse(
-            content={"config": current_config, "env_locked": list(env_locked_keys)}
-        )
-
-    except Exception as e:
-        log.error(f"获取配置失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/config/save")
-async def save_config(
-    request: ConfigSaveRequest, token: str = Depends(verify_panel_token)
-):
-    """保存配置"""
-    try:
-        new_config = request.config
-
-        log.debug(f"收到的配置数据: {list(new_config.keys())}")
-        log.debug(f"收到的password值: {new_config.get('password', 'NOT_FOUND')}")
-
-        # 验证配置项
-        if "retry_429_max_retries" in new_config:
-            if (
-                not isinstance(new_config["retry_429_max_retries"], int)
-                or new_config["retry_429_max_retries"] < 0
-            ):
-                raise HTTPException(
-                    status_code=400, detail="最大429重试次数必须是大于等于0的整数"
-                )
-
-        if "retry_429_enabled" in new_config:
-            if not isinstance(new_config["retry_429_enabled"], bool):
-                raise HTTPException(status_code=400, detail="429重试开关必须是布尔值")
-
-        # 验证新的配置项
-        if "retry_429_interval" in new_config:
-            try:
-                interval = float(new_config["retry_429_interval"])
-                if interval < 0.01 or interval > 10:
-                    raise HTTPException(
-                        status_code=400, detail="429重试间隔必须在0.01-10秒之间"
-                    )
-            except (ValueError, TypeError):
-                raise HTTPException(
-                    status_code=400, detail="429重试间隔必须是有效的数字"
-                )
-
-        if "anti_truncation_max_attempts" in new_config:
-            if (
-                not isinstance(new_config["anti_truncation_max_attempts"], int)
-                or new_config["anti_truncation_max_attempts"] < 1
-                or new_config["anti_truncation_max_attempts"] > 10
-            ):
-                raise HTTPException(
-                    status_code=400, detail="抗截断最大重试次数必须是1-10之间的整数"
-                )
-
-        if "compatibility_mode_enabled" in new_config:
-            if not isinstance(new_config["compatibility_mode_enabled"], bool):
-                raise HTTPException(
-                    status_code=400, detail="兼容性模式开关必须是布尔值"
-                )
-
-        if "return_thoughts_to_frontend" in new_config:
-            if not isinstance(new_config["return_thoughts_to_frontend"], bool):
-                raise HTTPException(
-                    status_code=400, detail="思维链返回开关必须是布尔值"
-                )
-
-        if "antigravity_stream2nostream" in new_config:
-            if not isinstance(new_config["antigravity_stream2nostream"], bool):
-                raise HTTPException(
-                    status_code=400, detail="Antigravity流式转非流式开关必须是布尔值"
-                )
-
-        # 验证服务器配置
-        if "host" in new_config:
-            if (
-                not isinstance(new_config["host"], str)
-                or not new_config["host"].strip()
-            ):
-                raise HTTPException(status_code=400, detail="服务器主机地址不能为空")
-
-        if "port" in new_config:
-            if (
-                not isinstance(new_config["port"], int)
-                or new_config["port"] < 1
-                or new_config["port"] > 65535
-            ):
-                raise HTTPException(
-                    status_code=400, detail="端口号必须是1-65535之间的整数"
-                )
-
-        if "api_password" in new_config:
-            if not isinstance(new_config["api_password"], str):
-                raise HTTPException(status_code=400, detail="API访问密码必须是字符串")
-
-        if "panel_password" in new_config:
-            if not isinstance(new_config["panel_password"], str):
-                raise HTTPException(status_code=400, detail="控制面板密码必须是字符串")
-
-        if "password" in new_config:
-            if not isinstance(new_config["password"], str):
-                raise HTTPException(status_code=400, detail="访问密码必须是字符串")
-
-        # 获取环境变量锁定的配置键
-        env_locked_keys = get_env_locked_keys()
-
-        # 直接使用存储适配器保存配置
-        storage_adapter = await get_storage_adapter()
-        for key, value in new_config.items():
-            if key not in env_locked_keys:
-                await storage_adapter.set_config(key, value)
-                if key in ("password", "api_password", "panel_password"):
-                    log.debug(f"设置{key}字段为: {value}")
-
-        # 重新加载配置缓存（关键！）
-        await config.reload_config()
-
-        # 验证保存后的结果
-        test_api_password = await config.get_api_password()
-        test_panel_password = await config.get_panel_password()
-        test_password = await config.get_server_password()
-        log.debug(f"保存后立即读取的API密码: {test_api_password}")
-        log.debug(f"保存后立即读取的面板密码: {test_panel_password}")
-        log.debug(f"保存后立即读取的通用密码: {test_password}")
-
-        # 构建响应消息
-        response_data = {
-            "message": "配置保存成功",
-            "saved_config": {
-                k: v for k, v in new_config.items() if k not in env_locked_keys
-            },
-        }
-
-        return JSONResponse(content=response_data)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"保存配置失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# =============================================================================
-# 实时日志WebSocket (Real-time Logs WebSocket)
-# =============================================================================
-
-
-@router.post("/logs/clear")
-async def clear_logs(token: str = Depends(verify_panel_token)):
-    """清空日志文件"""
-    try:
-        # 直接使用环境变量获取日志文件路径
-        log_file_path = os.getenv("LOG_FILE", "log.txt")
-
-        # 检查日志文件是否存在
-        if os.path.exists(log_file_path):
-            try:
-                # 清空文件内容（保留文件），确保以UTF-8编码写入
-                with open(log_file_path, "w", encoding="utf-8", newline="") as f:
-                    f.write("")
-                    f.flush()  # 强制刷新到磁盘
-                log.info(f"日志文件已清空: {log_file_path}")
-
-                # 通知所有WebSocket连接日志已清空
-                await manager.broadcast("--- 日志文件已清空 ---")
-
-                return JSONResponse(
-                    content={
-                        "message": f"日志文件已清空: {os.path.basename(log_file_path)}"
-                    }
-                )
-            except Exception as e:
-                log.error(f"清空日志文件失败: {e}")
-                raise HTTPException(
-                    status_code=500, detail=f"清空日志文件失败: {str(e)}"
-                )
-        else:
-            return JSONResponse(content={"message": "日志文件不存在"})
-
-    except Exception as e:
-        log.error(f"清空日志文件失败: {e}")
-        raise HTTPException(status_code=500, detail=f"清空日志文件失败: {str(e)}")
-
-
-@router.get("/logs/download")
-async def download_logs(token: str = Depends(verify_panel_token)):
-    """下载日志文件"""
-    try:
-        # 直接使用环境变量获取日志文件路径
-        log_file_path = os.getenv("LOG_FILE", "log.txt")
-
-        # 检查日志文件是否存在
-        if not os.path.exists(log_file_path):
-            raise HTTPException(status_code=404, detail="日志文件不存在")
-
-        # 检查文件是否为空
-        file_size = os.path.getsize(log_file_path)
-        if file_size == 0:
-            raise HTTPException(status_code=404, detail="日志文件为空")
-
-        # 生成文件名（包含时间戳）
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"gcli2api_logs_{timestamp}.txt"
-
-        log.info(f"下载日志文件: {log_file_path}")
-
-        return FileResponse(
-            path=log_file_path,
-            filename=filename,
-            media_type="text/plain",
-            headers={"Content-Disposition": f"attachment; filename={filename}"},
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"下载日志文件失败: {e}")
-        raise HTTPException(status_code=500, detail=f"下载日志文件失败: {str(e)}")
-
-
-@router.websocket("/logs/stream")
-async def websocket_logs(websocket: WebSocket):
-    """WebSocket端点，用于实时日志流"""
-    # WebSocket 认证: 从查询参数获取 token
-    token = websocket.query_params.get("token")
-
-    if not token:
-        await websocket.close(code=403, reason="Missing authentication token")
-        log.warning("WebSocket连接被拒绝: 缺少认证token")
-        return
-
-    # 验证 token
-    try:
-        panel_password = await config.get_panel_password()
-        if token != panel_password:
-            await websocket.close(code=403, reason="Invalid authentication token")
-            log.warning("WebSocket连接被拒绝: token验证失败")
-            return
-    except Exception as e:
-        await websocket.close(code=1011, reason="Authentication error")
-        log.error(f"WebSocket认证过程出错: {e}")
-        return
-
-    # 检查连接数限制
-    if not await manager.connect(websocket):
-        return
-
-    try:
-        # 直接使用环境变量获取日志文件路径
-        log_file_path = os.getenv("LOG_FILE", "log.txt")
-
-        # 发送初始日志（限制为最后50行，减少内存占用）
-        if os.path.exists(log_file_path):
-            try:
-                with open(log_file_path, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-                    # 只发送最后50行，减少初始内存消耗
-                    for line in lines[-50:]:
-                        if line.strip():
-                            await websocket.send_text(line.strip())
-            except Exception as e:
-                await websocket.send_text(f"Error reading log file: {e}")
-
-        # 监控日志文件变化
-        last_size = (
-            os.path.getsize(log_file_path) if os.path.exists(log_file_path) else 0
-        )
-        max_read_size = 8192  # 限制单次读取大小为8KB，防止大量日志造成内存激增
-        check_interval = 2  # 增加检查间隔，减少CPU和I/O开销
-
-        # 创建后台任务监听客户端断开
-        # 即使没有日志更新，receive_text() 也能即时感知断开
-        async def listen_for_disconnect():
-            try:
-                while True:
-                    await websocket.receive_text()
-            except Exception:
-                pass
-
-        listener_task = asyncio.create_task(listen_for_disconnect())
-
-        try:
-            while websocket.client_state == WebSocketState.CONNECTED:
-                # 使用 asyncio.wait 同时等待定时器和断开信号
-                # timeout=check_interval 替代了 asyncio.sleep
-                done, pending = await asyncio.wait(
-                    [listener_task],
-                    timeout=check_interval,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-
-                # 如果监听任务结束（通常是因为连接断开），则退出循环
-                if listener_task in done:
-                    break
-
-                if os.path.exists(log_file_path):
-                    current_size = os.path.getsize(log_file_path)
-                    if current_size > last_size:
-                        # 限制读取大小，防止单次读取过多内容
-                        read_size = min(current_size - last_size, max_read_size)
-
-                        try:
-                            with open(
-                                log_file_path, "r", encoding="utf-8", errors="replace"
-                            ) as f:
-                                f.seek(last_size)
-                                new_content = f.read(read_size)
-
-                                # 处理编码错误的情况
-                                if not new_content:
-                                    last_size = current_size
-                                    continue
-
-                                # 分行发送，避免发送不完整的行
-                                lines = new_content.splitlines(keepends=True)
-                                if lines:
-                                    # 如果最后一行没有换行符，保留到下次处理
-                                    if not lines[-1].endswith("\n") and len(lines) > 1:
-                                        # 除了最后一行，其他都发送
-                                        for line in lines[:-1]:
-                                            if line.strip():
-                                                await websocket.send_text(line.rstrip())
-                                        # 更新位置，但要退回最后一行的字节数
-                                        last_size += len(
-                                            new_content.encode("utf-8")
-                                        ) - len(lines[-1].encode("utf-8"))
-                                    else:
-                                        # 所有行都发送
-                                        for line in lines:
-                                            if line.strip():
-                                                await websocket.send_text(line.rstrip())
-                                        last_size += len(new_content.encode("utf-8"))
-                        except UnicodeDecodeError as e:
-                            # 遇到编码错误时，跳过这部分内容
-                            log.warning(f"WebSocket日志读取编码错误: {e}, 跳过部分内容")
-                            last_size = current_size
-                        except Exception as e:
-                            await websocket.send_text(f"Error reading new content: {e}")
-                            # 发生其他错误时，重置文件位置
-                            last_size = current_size
-
-                    # 如果文件被截断（如清空日志），重置位置
-                    elif current_size < last_size:
-                        last_size = 0
-                        await websocket.send_text("--- 日志已清空 ---")
-
-        finally:
-            # 确保清理监听任务
-            if not listener_task.done():
-                listener_task.cancel()
-                try:
-                    await listener_task
-                except asyncio.CancelledError:
-                    pass
-
-    except WebSocketDisconnect:
-        pass
-    except Exception as e:
-        log.error(f"WebSocket logs error: {e}")
-    finally:
-        manager.disconnect(websocket)
-
-
-async def verify_credential_project_common(
-    filename: str, mode: str = "geminicli"
-) -> JSONResponse:
-    """验证并重新获取凭证的project id的通用函数"""
-    mode = validate_mode(mode)
-
-    # 验证文件名
-    if not filename.endswith(".json"):
-        raise HTTPException(status_code=400, detail="无效的文件名")
-
-    storage_adapter = await get_storage_adapter()
-
-    # 获取凭证数据
-    credential_data = await storage_adapter.get_credential(filename, mode=mode)
-    if not credential_data:
-        raise HTTPException(status_code=404, detail="凭证不存在")
-
-    # 创建凭证对象
-    credentials = Credentials.from_dict(credential_data)
-
-    # 确保token有效（自动刷新）
-    token_refreshed = await credentials.refresh_if_needed()
-
-    # 如果token被刷新了，更新存储
-    if token_refreshed:
-        log.info(f"Token已自动刷新: {filename} (mode={mode})")
-        credential_data = credentials.to_dict()
-        await storage_adapter.store_credential(filename, credential_data, mode=mode)
-
-    # 获取API端点和对应的User-Agent
-    if mode == "antigravity":
-        api_base_url = await get_antigravity_api_url()
-        user_agent = ANTIGRAVITY_USER_AGENT
-    else:
-        api_base_url = await get_code_assist_endpoint()
-        user_agent = GEMINICLI_USER_AGENT
-
-    # 重新获取project id
-    project_id = await fetch_project_id(
-        access_token=credentials.access_token,
-        user_agent=user_agent,
-        api_base_url=api_base_url,
-    )
-
-    if project_id:
-        # 更新凭证数据中的project_id
-        credential_data["project_id"] = project_id
-        await storage_adapter.store_credential(filename, credential_data, mode=mode)
-
-        # 检验成功后自动解除禁用状态并清除错误码
-        await storage_adapter.update_credential_state(
-            filename, {"disabled": False, "error_codes": []}, mode=mode
-        )
-
-        log.info(
-            f"检验 {mode} 凭证成功: {filename} - Project ID: {project_id} - 已解除禁用并清除错误码"
-        )
-
-        return JSONResponse(
-            content={
-                "success": True,
-                "filename": filename,
-                "project_id": project_id,
-                "message": "检验成功！Project ID已更新，已解除禁用状态并清除错误码，403错误应该已恢复",
-            }
-        )
-    else:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "success": False,
-                "filename": filename,
-                "message": "检验失败：无法获取Project ID，请检查凭证是否有效",
-            },
-        )
-
-
-@router.post("/creds/verify-project/{filename}")
->>>>>>> ae59650 (feat: add usage statistics UI and API endpoint):src/web_routes.py
-async def verify_credential_project(
-    filename: str, token: str = Depends(verify_panel_token), mode: str = "geminicli"
-):
-    """
-    检验凭证的project id，重新获取project id
-    检验成功可以使403错误恢复
-    """
-    try:
-        mode = validate_mode(mode)
-        return await verify_credential_project_common(filename, mode=mode)
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"检验凭证Project ID失败 {filename}: {e}")
-        raise HTTPException(status_code=500, detail=f"检验失败: {str(e)}")
-
-
-@router.get("/errors/{filename}")
-async def get_credential_errors(
-    filename: str, token: str = Depends(verify_panel_token), mode: str = "geminicli"
-):
-    """
-    获取指定凭证的错误信息（包含 error_codes 和 error_messages）
-
-    Args:
-        filename: 凭证文件名
-        mode: 凭证模式（geminicli 或 antigravity）
-
-    Returns:
-        包含 error_codes 和 error_messages 的 JSON 响应
-    """
-    try:
-        mode = validate_mode(mode)
-
-        # 验证文件名
-        if not filename.endswith(".json"):
-            raise HTTPException(status_code=400, detail="无效的文件名")
-
-        storage_adapter = await get_storage_adapter()
-
-        # 检查后端是否支持 get_credential_errors 方法
-        if not hasattr(storage_adapter._backend, "get_credential_errors"):
-            raise HTTPException(
-                status_code=501, detail="当前存储后端不支持获取错误信息"
-            )
-
-        # 获取错误信息
-        error_info = await storage_adapter._backend.get_credential_errors(
-            filename, mode=mode
-        )
-
-        return JSONResponse(content=error_info)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.error(f"获取凭证错误信息失败 {filename}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-<<<<<<< HEAD:src/panel/creds.py
-@router.get("/quota/{filename}")
-=======
-@router.get("/stats/usage")
-async def get_usage_stats(
-    start_date: str = None,
-    end_date: str = None,
-    filename: str = None,
-    model: str = None,
-    limit: int = 100,
-    token: str = Depends(verify_panel_token),
-):
-    """
-    获取使用统计数据
-    """
-    try:
-        storage_adapter = await get_storage_adapter()
-
-        # 检查后端是否支持get_usage_stats
-        if not hasattr(storage_adapter, "get_usage_stats"):
-            return JSONResponse(content=[])
-
-        stats = await storage_adapter.get_usage_stats(
-            start_date=start_date,
-            end_date=end_date,
-            filename=filename,
-            model=model,
-            limit=limit,
-        )
-        return JSONResponse(content=stats)
-
-    except Exception as e:
-        log.error(f"获取使用统计失败: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/creds/quota/{filename}")
->>>>>>> ae59650 (feat: add usage statistics UI and API endpoint):src/web_routes.py
-async def get_credential_quota(
     filename: str, token: str = Depends(verify_panel_token), mode: str = "antigravity"
 ):
     """
@@ -2284,10 +1342,6 @@ async def get_credential_quota(
         if not filename.endswith(".json"):
             raise HTTPException(status_code=400, detail="无效的文件名")
 
-<<<<<<< HEAD:src/panel/creds.py
-
-=======
->>>>>>> ae59650 (feat: add usage statistics UI and API endpoint):src/web_routes.py
         storage_adapter = await get_storage_adapter()
 
         # 获取凭证数据
@@ -2347,9 +1401,7 @@ async def get_credential_quota(
 
 @router.post("/test/{filename}")
 async def test_credential(
-    filename: str,
-    mode: str = "geminicli",
-    _token: str = Depends(verify_panel_token)
+    filename: str, mode: str = "geminicli", _token: str = Depends(verify_panel_token)
 ):
     """
     测试指定凭证是否可用
@@ -2367,7 +1419,6 @@ async def test_credential(
     try:
         mode = validate_mode(mode)
 
-<<<<<<< HEAD:src/panel/creds.py
         # 验证文件名
         if not filename.endswith(".json"):
             raise HTTPException(status_code=400, detail="无效的文件名")
@@ -2382,31 +1433,6 @@ async def test_credential(
         # 创建凭证对象并尝试刷新 token（如果需要）
         credentials = Credentials.from_dict(credential_data)
         token_refreshed = await credentials.refresh_if_needed()
-=======
-        # 读取version.txt
-        if not os.path.exists(version_file):
-            return JSONResponse({"success": False, "error": "version.txt文件不存在"})
-
-        version_data = {}
-        with open(version_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if "=" in line:
-                    key, value = line.split("=", 1)
-                    version_data[key] = value
-
-        # 检查必要字段
-        if "short_hash" not in version_data:
-            return JSONResponse({"success": False, "error": "version.txt格式错误"})
-
-        response_data = {
-            "success": True,
-            "version": version_data.get("short_hash", "unknown"),
-            "full_hash": version_data.get("full_hash", ""),
-            "message": version_data.get("message", ""),
-            "date": version_data.get("date", ""),
-        }
->>>>>>> ae59650 (feat: add usage statistics UI and API endpoint):src/web_routes.py
 
         # 如果 token 被刷新了，更新存储
         if token_refreshed:
@@ -2415,13 +1441,13 @@ async def test_credential(
             await storage_adapter.store_credential(filename, credential_data, mode=mode)
 
         # 获取访问令牌
-        access_token = credential_data.get("access_token") or credential_data.get("token")
+        access_token = credential_data.get("access_token") or credential_data.get(
+            "token"
+        )
         if not access_token:
             raise HTTPException(status_code=400, detail="凭证中没有访问令牌")
 
         # 根据模式构造测试请求
-        from src.httpx_client import post_async
-
         if mode == "antigravity":
             # 测试 Antigravity API - 使用 fetchAvailableModels
             api_base_url = await get_antigravity_api_url()
@@ -2431,7 +1457,7 @@ async def test_credential(
                 url=f"{api_base_url}/v1internal:fetchAvailableModels",
                 json={},
                 headers=build_antigravity_headers(access_token),
-                timeout=30.0
+                timeout=30.0,
             )
         else:
             # 测试 GeminiCli API - 使用最小的 generateContent 请求
@@ -2448,15 +1474,15 @@ async def test_credential(
                     "project": project_id,
                     "request": {
                         "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
-                        "generationConfig": {"maxOutputTokens": 1}
-                    }
+                        "generationConfig": {"maxOutputTokens": 1},
+                    },
                 },
                 headers={
                     "Authorization": f"Bearer {access_token}",
                     "Content-Type": "application/json",
                     "User-Agent": GEMINICLI_USER_AGENT,
                 },
-                timeout=30.0
+                timeout=30.0,
             )
 
         # 返回实际的状态码
@@ -2466,92 +1492,95 @@ async def test_credential(
             log.info(f"凭证测试成功: {filename} (mode={mode}, status={status_code})")
             # 测试成功时清除错误状态
             if status_code == 200:
-                await storage_adapter.update_credential_state(filename, {
-                    "error_codes": [],
-                    "error_messages": {}
-                }, mode=mode)
+                await storage_adapter.update_credential_state(
+                    filename, {"error_codes": [], "error_messages": {}}, mode=mode
+                )
         else:
             log.warning(f"凭证测试失败: {filename} (mode={mode}, status={status_code})")
             # 测试失败时保存错误码和错误消息
             try:
-                error_text = response.text if hasattr(response, 'text') else ""
+                error_text = response.text if hasattr(response, "text") else ""
 
                 # 打印详细错误内容到日志
-                log.error(f"凭证测试错误详情 - 文件: {filename}, 模式: {mode}, 状态码: {status_code}, 错误内容: {error_text}")
+                log.error(
+                    f"凭证测试错误详情 - 文件: {filename}, 模式: {mode}, 状态码: {status_code}, 错误内容: {error_text}"
+                )
 
                 # 获取当前状态
-                current_state = await storage_adapter.get_credential_state(filename, mode=mode) or {}
+                current_state = (
+                    await storage_adapter.get_credential_state(filename, mode=mode)
+                    or {}
+                )
                 error_codes = current_state.get("error_codes", [])
                 error_messages = current_state.get("error_messages", {})
 
-<<<<<<< HEAD:src/panel/creds.py
                 # 更新错误码列表（避免重复）
                 if status_code not in error_codes:
                     error_codes.append(status_code)
 
                 # 保存错误消息
-                error_messages[str(status_code)] = error_text if error_text else f"HTTP {status_code}"
+                error_messages[str(status_code)] = (
+                    error_text if error_text else f"HTTP {status_code}"
+                )
 
                 # 更新状态
-                await storage_adapter.update_credential_state(filename, {
-                    "error_codes": error_codes,
-                    "error_messages": error_messages
-                }, mode=mode)
-=======
-                if resp.status_code == 200:
-                    # 解析远程version.txt
-                    remote_version_data = {}
-                    for line in resp.text.strip().split("\n"):
-                        line = line.strip()
-                        if "=" in line:
-                            key, value = line.split("=", 1)
-                            remote_version_data[key] = value
-
-                    latest_hash = remote_version_data.get("full_hash", "")
-                    latest_short_hash = remote_version_data.get("short_hash", "")
-                    current_hash = version_data.get("full_hash", "")
-
-                    has_update = (
-                        (current_hash != latest_hash)
-                        if current_hash and latest_hash
-                        else None
-                    )
-
-                    response_data["check_update"] = True
-                    response_data["has_update"] = has_update
-                    response_data["latest_version"] = latest_short_hash
-                    response_data["latest_hash"] = latest_hash
-                    response_data["latest_message"] = remote_version_data.get(
-                        "message", ""
-                    )
-                    response_data["latest_date"] = remote_version_data.get("date", "")
-                else:
-                    # GitHub获取失败，但不影响基本版本信息
-                    response_data["check_update"] = False
-                    response_data["update_error"] = (
-                        f"GitHub返回错误: {resp.status_code}"
-                    )
->>>>>>> ae59650 (feat: add usage statistics UI and API endpoint):src/web_routes.py
+                await storage_adapter.update_credential_state(
+                    filename,
+                    {"error_codes": error_codes, "error_messages": error_messages},
+                    mode=mode,
+                )
 
                 log.info(f"已保存测试错误信息: {filename} - 错误码 {status_code}")
             except Exception as e:
-<<<<<<< HEAD:src/panel/creds.py
                 log.error(f"保存测试错误信息失败: {e}")
-=======
-                log.debug(f"检查更新失败: {e}")
-                response_data["check_update"] = False
-                response_data["update_error"] = str(e)
->>>>>>> ae59650 (feat: add usage statistics UI and API endpoint):src/web_routes.py
 
         return Response(status_code=status_code)
 
     except HTTPException:
         raise
     except Exception as e:
-<<<<<<< HEAD:src/panel/creds.py
         log.error(f"测试凭证失败 {filename}: {e}")
         raise HTTPException(status_code=500, detail=f"测试失败: {str(e)}")
-=======
-        log.error(f"获取版本信息失败: {e}")
-        return JSONResponse({"success": False, "error": str(e)})
->>>>>>> ae59650 (feat: add usage statistics UI and API endpoint):src/web_routes.py
+
+
+@router.get("/errors/{filename}")
+async def get_credential_errors(
+    filename: str, token: str = Depends(verify_panel_token), mode: str = "geminicli"
+):
+    """
+    获取指定凭证的错误信息（包含 error_codes 和 error_messages）
+
+    Args:
+        filename: 凭证文件名
+        mode: 凭证模式（geminicli 或 antigravity）
+
+    Returns:
+        包含 error_codes 和 error_messages 的 JSON 响应
+    """
+    try:
+        mode = validate_mode(mode)
+
+        # 验证文件名
+        if not filename.endswith(".json"):
+            raise HTTPException(status_code=400, detail="无效的文件名")
+
+        storage_adapter = await get_storage_adapter()
+
+        # 检查后端是否支持 get_credential_errors 方法
+        if not hasattr(storage_adapter._backend, "get_credential_errors"):
+            raise HTTPException(
+                status_code=501, detail="当前存储后端不支持获取错误信息"
+            )
+
+        # 获取错误信息
+        error_info = await storage_adapter._backend.get_credential_errors(
+            filename, mode=mode
+        )
+
+        return JSONResponse(content=error_info)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error(f"获取凭证错误信息失败 {filename}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
