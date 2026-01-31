@@ -312,14 +312,29 @@ async def stream_request(
                         elif isinstance(chunk, bytes):
                             chunk_str = chunk.decode("utf-8", errors="ignore")
 
-                        if chunk_str and chunk_str.startswith("data: "):
-                            data_part = chunk_str[6:].strip()
-                            if data_part and data_part != "[DONE]":
-                                data_json = json.loads(data_part)
-                                if "usageMetadata" in data_json:
-                                    usage_metadata = data_json["usageMetadata"]
-                    except Exception:
-                        pass
+                        if chunk_str:
+                            # 按行分割处理多个SSE事件
+                            lines = chunk_str.strip().split("\n")
+                            for line in lines:
+                                line = line.strip()
+                                if line.startswith("data: ") and line != "data: [DONE]":
+                                    data_part = line[6:].strip()
+                                    if data_part:
+                                        try:
+                                            data_json = json.loads(data_part)
+                                            if "usageMetadata" in data_json:
+                                                usage_metadata = data_json[
+                                                    "usageMetadata"
+                                                ]
+                                                log.debug(
+                                                    f"[GEMINICLI STREAM] Found usage metadata: {usage_metadata}"
+                                                )
+                                        except json.JSONDecodeError:
+                                            continue
+                    except Exception as e:
+                        log.warning(
+                            f"[GEMINICLI STREAM] Failed to parse chunk for usage: {e}"
+                        )
 
             # 流式请求完成，检查结果
             if success_recorded:
@@ -504,6 +519,9 @@ async def non_stream_request(
                     resp_json = response.json()
                     usage = resp_json.get("usageMetadata", {})
                     total_tokens = usage.get("totalTokenCount", 0)
+                    log.debug(
+                        f"[GEMINICLI NON-STREAM] Usage metadata: {usage}, total_tokens: {total_tokens}"
+                    )
                     await credential_manager.record_usage(
                         current_file, model_name, total_tokens, True
                     )
