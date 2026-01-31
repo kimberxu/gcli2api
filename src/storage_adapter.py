@@ -25,11 +25,15 @@ class StorageBackend(Protocol):
         ...
 
     # 凭证管理
-    async def store_credential(self, filename: str, credential_data: Dict[str, Any], mode: str = "geminicli") -> bool:
+    async def store_credential(
+        self, filename: str, credential_data: Dict[str, Any], mode: str = "geminicli"
+    ) -> bool:
         """存储凭证数据"""
         ...
 
-    async def get_credential(self, filename: str, mode: str = "geminicli") -> Optional[Dict[str, Any]]:
+    async def get_credential(
+        self, filename: str, mode: str = "geminicli"
+    ) -> Optional[Dict[str, Any]]:
         """获取凭证数据"""
         ...
 
@@ -42,15 +46,21 @@ class StorageBackend(Protocol):
         ...
 
     # 状态管理
-    async def update_credential_state(self, filename: str, state_updates: Dict[str, Any], mode: str = "geminicli") -> bool:
+    async def update_credential_state(
+        self, filename: str, state_updates: Dict[str, Any], mode: str = "geminicli"
+    ) -> bool:
         """更新凭证状态"""
         ...
 
-    async def get_credential_state(self, filename: str, mode: str = "geminicli") -> Dict[str, Any]:
+    async def get_credential_state(
+        self, filename: str, mode: str = "geminicli"
+    ) -> Dict[str, Any]:
         """获取凭证状态"""
         ...
 
-    async def get_all_credential_states(self, mode: str = "geminicli") -> Dict[str, Dict[str, Any]]:
+    async def get_all_credential_states(
+        self, mode: str = "geminicli"
+    ) -> Dict[str, Dict[str, Any]]:
         """获取所有凭证状态"""
         ...
 
@@ -67,8 +77,22 @@ class StorageBackend(Protocol):
         """获取所有配置"""
         ...
 
-    async def delete_config(self, key: str) -> bool:
-        """删除配置项"""
+    async def get_credential_errors(
+        self, filename: str, mode: str = "geminicli"
+    ) -> Dict[str, Any]:
+        """获取凭证错误信息"""
+        ...
+
+    # ============ 统计数据管理 ============
+    async def get_usage_stats(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        filename: Optional[str] = None,
+        model: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """查询使用统计"""
         ...
 
 
@@ -138,12 +162,16 @@ class StorageAdapter:
 
     # ============ 凭证管理 ============
 
-    async def store_credential(self, filename: str, credential_data: Dict[str, Any], mode: str = "geminicli") -> bool:
+    async def store_credential(
+        self, filename: str, credential_data: Dict[str, Any], mode: str = "geminicli"
+    ) -> bool:
         """存储凭证数据"""
         self._ensure_initialized()
         return await self._backend.store_credential(filename, credential_data, mode)
 
-    async def get_credential(self, filename: str, mode: str = "geminicli") -> Optional[Dict[str, Any]]:
+    async def get_credential(
+        self, filename: str, mode: str = "geminicli"
+    ) -> Optional[Dict[str, Any]]:
         """获取凭证数据"""
         self._ensure_initialized()
         return await self._backend.get_credential(filename, mode)
@@ -160,17 +188,25 @@ class StorageAdapter:
 
     # ============ 状态管理 ============
 
-    async def update_credential_state(self, filename: str, state_updates: Dict[str, Any], mode: str = "geminicli") -> bool:
+    async def update_credential_state(
+        self, filename: str, state_updates: Dict[str, Any], mode: str = "geminicli"
+    ) -> bool:
         """更新凭证状态"""
         self._ensure_initialized()
-        return await self._backend.update_credential_state(filename, state_updates, mode)
+        return await self._backend.update_credential_state(
+            filename, state_updates, mode
+        )
 
-    async def get_credential_state(self, filename: str, mode: str = "geminicli") -> Dict[str, Any]:
+    async def get_credential_state(
+        self, filename: str, mode: str = "geminicli"
+    ) -> Dict[str, Any]:
         """获取凭证状态"""
         self._ensure_initialized()
         return await self._backend.get_credential_state(filename, mode)
 
-    async def get_all_credential_states(self, mode: str = "geminicli") -> Dict[str, Dict[str, Any]]:
+    async def get_all_credential_states(
+        self, mode: str = "geminicli"
+    ) -> Dict[str, Dict[str, Any]]:
         """获取所有凭证状态"""
         self._ensure_initialized()
         return await self._backend.get_all_credential_states(mode)
@@ -197,9 +233,43 @@ class StorageAdapter:
         self._ensure_initialized()
         return await self._backend.delete_config(key)
 
+    async def get_credential_errors(
+        self, filename: str, mode: str = "geminicli"
+    ) -> Dict[str, Any]:
+        """获取凭证错误信息"""
+        self._ensure_initialized()
+        if hasattr(self._backend, "get_credential_errors"):
+            return await self._backend.get_credential_errors(filename, mode)
+        return {
+            "filename": filename,
+            "error_codes": [],
+            "error_messages": [],
+            "error": "Backend does not support get_credential_errors",
+        }
+
+    # ============ 统计数据管理 ============
+
+    async def get_usage_stats(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        filename: Optional[str] = None,
+        model: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """查询使用统计"""
+        self._ensure_initialized()
+        if hasattr(self._backend, "get_usage_stats"):
+            return await self._backend.get_usage_stats(
+                start_date, end_date, filename, model, limit
+            )
+        return []
+
     # ============ 工具方法 ============
 
-    async def export_credential_to_json(self, filename: str, output_path: str = None) -> bool:
+    async def export_credential_to_json(
+        self, filename: str, output_path: str = None
+    ) -> bool:
         """将凭证导出为JSON文件"""
         self._ensure_initialized()
         if hasattr(self._backend, "export_credential_to_json"):
@@ -221,7 +291,9 @@ class StorageAdapter:
         except Exception:
             return False
 
-    async def import_credential_from_json(self, json_path: str, filename: str = None) -> bool:
+    async def import_credential_from_json(
+        self, json_path: str, filename: str = None
+    ) -> bool:
         """从JSON文件导入凭证"""
         self._ensure_initialized()
         if hasattr(self._backend, "import_credential_from_json"):
@@ -276,13 +348,17 @@ class StorageAdapter:
                 info.update(
                     {
                         "database_path": getattr(self._backend, "_db_path", None),
-                        "credentials_dir": getattr(self._backend, "_credentials_dir", None),
+                        "credentials_dir": getattr(
+                            self._backend, "_credentials_dir", None
+                        ),
                     }
                 )
             elif backend_type == "mongodb":
                 info.update(
                     {
-                        "database_name": getattr(self._backend, "_db", {}).name if hasattr(self._backend, "_db") else None,
+                        "database_name": getattr(self._backend, "_db", {}).name
+                        if hasattr(self._backend, "_db")
+                        else None,
                     }
                 )
 

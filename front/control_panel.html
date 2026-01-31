@@ -1183,6 +1183,7 @@
                 <button class="tab" onclick="switchTab('manage')">GCLI凭证管理</button>
                 <button class="tab" onclick="switchTab('antigravity-manage')">Antigravity凭证管理</button>
                 <button class="tab" onclick="switchTab('config')">配置管理</button>
+                <button class="tab" onclick="switchTab('stats')">使用统计</button>
                 <button class="tab" onclick="switchTab('logs')">实时日志</button>
                 <button class="tab" onclick="switchTab('about')">项目信息</button>
             </div>
@@ -1960,6 +1961,77 @@
 
                         </div>
                     </div>
+                </div>
+            </div>
+
+            <!-- 使用统计标签页 -->
+            <div id="statsTab" class="tab-content">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                    <h3>API 使用统计</h3>
+                    <div style="display: flex; gap: 10px;">
+                        <button class="btn" style="width: auto; margin-bottom: 0; padding: 8px 15px; font-size: 14px;" onclick="loadUsageStats()">刷新统计</button>
+                    </div>
+                </div>
+
+                <div class="filter-container">
+                    <div>
+                        <label for="statsDateRange" style="display: inline-block; margin-right: 5px; font-weight: normal;">时间范围:</label>
+                        <select id="statsDateRange" class="filter-select" onchange="loadUsageStats()">
+                            <option value="today">今天</option>
+                            <option value="yesterday">昨天</option>
+                            <option value="7days" selected>最近7天</option>
+                            <option value="30days">最近30天</option>
+                            <option value="all">全部</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label for="statsModel" style="display: inline-block; margin-right: 5px; font-weight: normal;">模型:</label>
+                        <input type="text" id="statsModel" class="filter-select" placeholder="筛选模型..." onchange="loadUsageStats()" style="width: 150px;">
+                    </div>
+                    <div>
+                        <label for="statsFilename" style="display: inline-block; margin-right: 5px; font-weight: normal;">凭证文件:</label>
+                        <input type="text" id="statsFilename" class="filter-select" placeholder="筛选文件名..." onchange="loadUsageStats()" style="width: 150px;">
+                    </div>
+                </div>
+
+                <div class="stats-container">
+                    <div class="stat-item total">
+                        <span class="stat-number" id="statsTotalCalls">0</span>
+                        <span class="stat-label">总调用次数</span>
+                    </div>
+                    <div class="stat-item normal">
+                        <span class="stat-number" id="statsTotalSuccess">0</span>
+                        <span class="stat-label">成功次数</span>
+                    </div>
+                    <div class="stat-item disabled">
+                        <span class="stat-number" id="statsTotalTokens">0</span>
+                        <span class="stat-label">消耗 Tokens</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-number" id="statsSuccessRate">0%</span>
+                        <span class="stat-label">成功率</span>
+                    </div>
+                </div>
+
+                <div style="overflow-x: auto;">
+                    <table style="width: 100%; border-collapse: collapse; margin-top: 10px;">
+                        <thead>
+                            <tr style="background-color: #f8f9fa; border-bottom: 2px solid #e9ecef; text-align: left;">
+                                <th style="padding: 12px; font-weight: 600; color: #495057;">日期</th>
+                                <th style="padding: 12px; font-weight: 600; color: #495057;">凭证文件</th>
+                                <th style="padding: 12px; font-weight: 600; color: #495057;">模型</th>
+                                <th style="padding: 12px; font-weight: 600; color: #495057;">调用次数</th>
+                                <th style="padding: 12px; font-weight: 600; color: #495057;">成功/失败</th>
+                                <th style="padding: 12px; font-weight: 600; color: #495057;">Tokens</th>
+                                <th style="padding: 12px; font-weight: 600; color: #495057;">最后更新</th>
+                            </tr>
+                        </thead>
+                        <tbody id="statsTableBody">
+                            <tr>
+                                <td colspan="7" style="padding: 20px; text-align: center; color: #666;">加载中...</td>
+                            </tr>
+                        </tbody>
+                    </table>
                 </div>
             </div>
 
